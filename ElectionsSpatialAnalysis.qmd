@@ -1,0 +1,957 @@
+---
+title: "A spatial analysis of the Polish elections in 2019"
+author: Piotr Nowicki
+date: 04/23/2023
+date-format: "DD-MM-YYYY"
+format: 
+  pdf:
+    toc: true
+    geometry:
+      - top=30mm
+      - left=30mm
+    cap-location: top
+    include-in-body: 
+      text: |
+        - \usepackage{float}
+        - \floatplacement{table}{H}
+    fig-format: png
+pdf-engine: pdflatex
+editor: visual
+execute: 
+  cache: true
+  warning: false
+  message: false
+  echo: false
+theme: cosmo
+bibliography: references.bib
+---
+
+## Introduction
+
+This study is concerned with a spatial analysis of the Polish parliamentary elections in 2019 and comparing its changes to the elections in 2015. It covers an exploratory spatial analysis and spatial econometrics for every contender who obtained at least 5% (the threshold for entering the parliament for single parties) in the 2019 elections.
+
+Between the 2015 and 2019 elections, some parties changed their names and created larger political blocks with other parties. To have comparable entities in 2015 and 2019, political forces were recreated for 2015 according to the alliances in 2019.
+
+In 2019 the parties who obtained at least 5% were: PiS (Prawo i Sprawiedliwość - Law and Justice), KO (Koalicja Obywatelska - Civic Coalition), Lewica (The Left), PSL (Polskie Stronnictwo Ludowe - Polish People's Party), and Konfederacja (Confederation).
+
+Those political blocks were recreated in 2015 as follows:
+
+1.  PiS was unchanged.
+2.  KO was formed from PO (Platforma Obywatelska - Civic Platform) + Nowoczesna (Modern).
+3.  Lewica was formed from Zjednoczona Lewica (United Left) + Partia Razem (Together Party).
+4.  PSL was formed from PSL + Kukiz'15.
+5.  Confederation was associated with KORWiN.
+
+The unit of the analysis is *powiat* (NUTS 4). There are currently 380 *powiat* in Poland. The data were downloaded from the National Electoral Commission.
+
+This analysis is meant to be brief and concise. If you'd like more information, you can contact me. The codes can be found in the same repository on GitHub as this pdf. Throughout the analysis, I used a book written by @kopczewska2020.
+
+```{r}
+#| label: loading-data
+#| results: hide
+libraries <- c("spdep", "sfdep", "rgdal", "maptools", "sp", "sf",
+               "ggplot2", "tidyverse", "gridExtra", "spatialreg",
+               "cartography", "readxl", "texreg", "gtsummary", "modelsummary")
+lapply(libraries, require, character.only = T)
+
+wd <- getwd()
+setwd(paste0(wd, "/dane"))
+
+POW <- st_read("powiaty.shp")
+POW <- st_transform(POW, 4326)
+results <- read.csv("wyniki_powiaty.csv", sep = ";")
+results$Kod.TERYT <- as.integer(results$Kod.TERYT/100)
+results <- results[results$Powiat != c("zagranica", "statki"), 
+                   c(1, 2, 3, 4, 10, 12, 13, 15, 17)]
+colnames(results)[5:9] <- c("KO", "Konfederacja", "PSL", "PiS", "Lewica")
+
+for (i in 4:9) {
+  results[i] <- as.numeric(stringr::str_replace(results[, i], ',', '.'))
+}
+
+POW$jpt_kod_je <- as.integer(POW$jpt_kod_je)
+POW <- arrange(POW, jpt_kod_je)
+POW$PiS <- results$PiS
+POW$KO <- results$KO
+POW$PSL <- results$PSL
+POW$Lewica <- results$Lewica
+POW$Konfederacja <- results$Konfederacja
+
+cont.sf <- poly2nb(POW)
+cont.listw <- nb2listw(cont.sf, style = "W")
+st.cont <- st_contiguity(POW)
+st.weights <- st_weights(st.cont)
+
+results15 <- read_excel("wyniki2015.xls")
+results15$TERYT <- as.integer(results15$TERYT)
+results15 <- results15[!results15$Powiat %in% 
+                         c("Zagranica", "Statki (Gdynia)", "Statki (Gdańsk)"), 
+                       c(2, 3, 10:17)]
+colnames(results15)[3:10] <- c("PiS", "PO", "Razem", "KORWiN", 
+                               "PSL", "ZL", "Kukiz", "N")
+results15$KO <- results15$PO + results15$N
+results15$Lewica <- results15$ZL + results15$Razem
+results15$PSL <- results15$PSL + results15$Kukiz
+colnames(results15)[6] <- "Konfederacja" 
+
+POW15 <- st_read("powiaty.shp")
+POW15 <- st_transform(POW15, 4326)
+POW15$jpt_kod_je <- as.integer(POW15$jpt_kod_je)
+POW15 <- arrange(POW15, jpt_kod_je)
+POW15 <- merge(POW15, results15, by.x = "jpt_kod_je", by.y = "TERYT", all.x = T)
+
+data <- read_xlsx("zmienne.xlsx")
+```
+
+## Data description
+
+The @tbl-sum-1 and @tbl-sum-2 contain descriptive statistics for the elections in 2019 and 2015. Median vote shares increased for Konfederacja, Lewica, and PiS. They decreased for KO and PSL. In @tbl-variables you can find the description of variables used later in the estimation of models. They were all downloaded from the Central Statistical Office in Poland.
+
+```{r}
+#| label: tbl-sum
+#| tbl-cap:
+#|   - "Election results for 2019"
+#|   - "Election results for 2015"
+#| column: page
+
+res <- pivot_longer(results, c("PiS", "KO", "Lewica", "PSL", "Konfederacja"), names_to = "party", values_to = "Vote share")[5:6]
+
+my_theme <-
+  list(
+    "tbl_summary-str:default_con_type" = "continuous2",
+    "tbl_summary-str:continuous_stat" = c(
+      "{min}",
+      "{p25}",
+      "{median}",
+      "{mean}",
+      "{p75}",
+      "{max}"
+    )
+  )
+gtsummary::set_gtsummary_theme(my_theme)
+
+  gtsummary::tbl_summary(res, 
+                         by = party,
+                         digits = everything() ~ 2
+  ) %>%
+  bold_labels() %>% 
+  modify_header(all_stat_cols() ~ "**{level}**",
+                label ~ "**Party**")
+  
+res15 <- pivot_longer(results15, c("PiS", "KO", "Lewica", "PSL", "Konfederacja"), names_to = "party", values_to = "Vote share")[8:9]
+
+my_theme <-
+  list(
+    "tbl_summary-str:default_con_type" = "continuous2",
+    "tbl_summary-str:continuous_stat" = c(
+      "{min}",
+      "{p25}",
+      "{median}",
+      "{mean}",
+      "{p75}",
+      "{max}"
+    )
+  )
+gtsummary::set_gtsummary_theme(my_theme)
+
+gtsummary::tbl_summary(res15, 
+                       by = party,
+                       digits = everything() ~ 2) %>%
+bold_labels() %>% 
+modify_header(all_stat_cols() ~ "**{level}**",
+              label ~ "**Party**")
+```
+
+|    Variable     |                               Description                                |
+|:----------------:|:----------------------------------------------------:|
+|     salary      |        Ratio of mean salary in a region to mean salary in Poland         |
+|  feminisation   |                       Number of women per 100 men                        |
+|  firms_per10k   |     Ratio of number of firms per 10k citizens to the mean in Poland      |
+|   demography    | Ratio of people in post-productive period to people in productive period |
+|   pop_per_km    |                  Number of people per 1 km2 in a region                  |
+|  unemployment   |                      Unemployment rate in a region                       |
+| poverty_per1000 | Ratio of number of people in poverty per 1000 citizens to Poland's mean  |
+|  investments_pc  |       Ratio of investments per capita in a region to Poland's mean       |
+
+: Description of variable {#tbl-variables}
+
+## Spatial data analysis
+
+The election results by region and contender are presented in @fig-voteshares. A contiguity spatial weights matrix was chosen for the analysis (the closest regions are expected to be the most relevant). PiS is the most popular in south-eastern Poland, whereas the opposite is true for KO and Lewica. PSL has the highest votes share in central and northeastern Poland. Konfederacja's best results can be found on the borders of Poland.
+
+```{r}
+#| label: fig-voteshares
+#| fig-cap: "2019 election results for every political party"
+#| fig-subcap:
+#|   - "PiS"
+#|   - "KO"
+#|   - "Lewica"
+#|   - "PSL"
+#|   - "Konfederacja"
+#| layout: [[1,1], [1,1], [1, 1]]
+#| column: page
+
+choroLayer(POW, var = "PiS",
+              col = carto.pal(pal1 = "blue.pal", n1 = 10))
+choroLayer(POW, var = "KO",
+              col = carto.pal(pal1 = "sand.pal", n1 = 10))
+choroLayer(POW, var = "Lewica",
+              col = carto.pal(pal1 = "red.pal", n1 = 10))
+choroLayer(POW, var = "PSL",
+              col = carto.pal(pal1 = "green.pal", n1 = 10))
+choroLayer(POW, var = "Konfederacja",
+              col = carto.pal(pal1 = "grey.pal", n1 = 10))
+
+```
+
+Global Moran's test statistics were included in @tbl-moran-1 and @tbl-moran-2. All of them are statistically significant at a 5% level and indicate spatial dependence in political parties' vote share. Curiously, the spatial autocorrelation decreased for the largest parties and increased for the smallest ones between 2015 and 2019. Furthermore, the higher the vote share, the higher the spatial autocorrelation.
+
+```{r}
+#| label: tbl-moran
+#| tbl-cap: 
+#|   - "Global Moran tests 2019"
+#|   - "Global Moran tests 2015"
+
+knitr::kable(data.frame(
+"PiS" = c( 
+moran.test(POW$PiS, cont.listw, alternative = "two.sided")$statistic,
+moran.test(POW$PiS, cont.listw, alternative = "two.sided")$p.value),
+"KO" = c( 
+moran.test(POW$KO, cont.listw, alternative = "two.sided")$statistic,
+moran.test(POW$KO, cont.listw, alternative = "two.sided")$p.value),
+"Lewica" = c( 
+moran.test(POW$Lewica, cont.listw, alternative = "two.sided")$statistic,
+moran.test(POW$Lewica, cont.listw, alternative = "two.sided")$p.value),
+"PSL" = c( 
+moran.test(POW$PSL, cont.listw, alternative = "two.sided")$statistic,
+moran.test(POW$PSL, cont.listw, alternative = "two.sided")$p.value),
+"Konfederacja" = c( 
+moran.test(POW$Konfederacja, cont.listw, alternative = "two.sided")$statistic,
+moran.test(POW$Konfederacja, cont.listw, alternative = "two.sided")$p.value),
+row.names = c("statistic", "p.value")
+))
+
+knitr::kable(data.frame(
+"PiS" = c( 
+moran.test(results15$PiS, cont.listw, alternative = "two.sided")$statistic,
+moran.test(results15$PiS, cont.listw, alternative = "two.sided")$p.value),
+"KO" = c( 
+moran.test(results15$KO, cont.listw, alternative = "two.sided")$statistic,
+moran.test(results15$KO, cont.listw, alternative = "two.sided")$p.value),
+"Lewica" = c( 
+moran.test(results15$Lewica, cont.listw, alternative = "two.sided")$statistic,
+moran.test(results15$Lewica, cont.listw, alternative = "two.sided")$p.value),
+"PSL" = c( 
+moran.test(results15$PSL, cont.listw, alternative = "two.sided")$statistic,
+moran.test(results15$PSL, cont.listw, alternative = "two.sided")$p.value),
+"Konfederacja" = c( 
+moran.test(results15$Konfederacja, cont.listw, alternative = "two.sided")$statistic,
+moran.test(results15$Konfederacja, cont.listw, alternative = "two.sided")$p.value),
+row.names = c("statistic", "p.value")
+))
+```
+
+@fig-moran presents local Moran statistics. The dark colour indicates local positive spatial autocorrelation and the light colour negative spatial autocorrelation. The statistic was not significant at a 5% level for regions in white. Two main regions are exhibiting spatial autocorrelation for the 3 largest parties - eastern and north-western Poland. However, for PSL spatial autocorrelation is in central and northern Poland, and for Konfederacja in central Poland.
+
+@fig-GetisOrd shows *hot-spots* based on a local Getis-Ord statistic. The orange indicates regions surrounded by regions with high values, and the light blue indicates regions surrounded by regions with low values. Eastern Poland is a cluster of high values for PiS and low values for KO and Lewica. The opposite is true for western Poland. Central-northern Poland is a region with high values for PSL, while Konfederacja's high votes share concentrates in the periphery. Interestingly, for PiS and PSL spatial autocorrelation is seen in regions with high votes share, whereas for the others it is usually around regions with lower votes share.
+
+```{r}
+#| label: local Moran plots 
+locM_PiS <- as.data.frame(localmoran(spNamedVec("PiS", results), 
+                                     cont.listw))
+locM_KO <- as.data.frame(localmoran(spNamedVec("KO", results), 
+                                    cont.listw))
+locM_Lewica <- as.data.frame(localmoran(spNamedVec("Lewica", results), 
+                                        cont.listw))
+locM_PSL <- as.data.frame(localmoran(spNamedVec("PSL", results), 
+                                     cont.listw))
+locM_Konf <- as.data.frame(localmoran(spNamedVec("Konfederacja", results), 
+                                      cont.listw))
+
+locM_PiS15 <- as.data.frame(localmoran(results15$PiS, cont.listw))
+locM_KO15 <- as.data.frame(localmoran(results15$KO, cont.listw))
+locM_Lewica15 <- as.data.frame(localmoran(results15$Lewica, cont.listw))
+locM_PSL15 <- as.data.frame(localmoran(results15$PSL, cont.listw))
+locM_Konf15 <- as.data.frame(localmoran(results15$Konfederacja, cont.listw))
+
+brks_PiS <- c(min(locM_PiS[,5]), 0.05000, 0.95000, max(locM_PiS[,5]))
+brks_PiS15 <- c(min(locM_PiS15[,5]), 0.05000, 0.95000, max(locM_PiS15[,5]))
+cols_PiS <- c("darkblue", "grey90", "lightblue")
+brks_KO <- c(min(locM_KO[,5]), 0.05000, 0.95000, max(locM_KO[,5]))
+brks_KO15 <- c(min(locM_KO15[,5]), 0.05000, 0.95000, max(locM_KO15[,5]))
+cols_KO <- c("orange4", "grey90", "orange")
+brks_Lewica <- c(min(locM_Lewica[,5]), 0.05000, 0.95000, max(locM_Lewica[,5]))
+brks_Lewica15 <- c(min(locM_Lewica15[,5]), 0.05000, 0.95000, max(locM_Lewica15[,5]))
+cols_Lewica <- c("darkred", "grey90", "red")
+brks_PSL <- c(min(locM_PSL[,5]), 0.05000, 0.95000, max(locM_PSL[,5]))
+brks_PSL15 <- c(min(locM_PSL15[,5]), 0.05000, 0.95000, max(locM_PSL15[,5]))
+cols_PSL <- c("darkgreen", "grey90", "lightgreen")
+brks_Konf <- c(min(locM_Konf[,5]), 0.05000, 0.95000, max(locM_Konf[,5]))
+brks_Konf15 <- c(min(locM_Konf15[,5]), 0.05000, 0.95000, max(locM_Konf15[,5]))
+cols_Konf <- c("grey30", "grey90", "grey60")
+
+ggplot(POW)+
+  geom_sf(aes(fill=factor(cut(locM_PiS[,5], 
+                              breaks=brks_PiS, 
+                              include.lowest = T))),
+          show.legend = F) +
+  scale_fill_manual(values = cols_PiS) +
+  #ggtitle("PiS 2019") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank()) -> plotM_PiS
+ggplot(POW)+
+  geom_sf(aes(fill=factor(cut(locM_KO[,5], 
+                              breaks=brks_KO, 
+                              include.lowest = T))),
+          show.legend = F) +
+  scale_fill_manual(values = cols_KO) +
+  #ggtitle("KO 2019") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank()) -> plotM_KO
+ggplot(POW)+
+  geom_sf(aes(fill=factor(cut(locM_Lewica[,5], 
+                              breaks=brks_Lewica, 
+                              include.lowest = T))),
+          show.legend = F) +
+  scale_fill_manual(values = cols_Lewica) +
+  #ggtitle("Lewica 2019") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank()) -> plotM_Lewica
+ggplot(POW)+
+  geom_sf(aes(fill=factor(cut(locM_PSL[,5], 
+                              breaks=brks_PSL, 
+                              include.lowest = T))),
+          show.legend = F) +
+  scale_fill_manual(values = cols_PSL) +
+  #ggtitle("PSL 2019") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank()) -> plotM_PSL
+ggplot(POW)+
+  geom_sf(aes(fill=factor(cut(locM_Konf[,5], 
+                              breaks=brks_Konf, 
+                              include.lowest = T))),
+          show.legend = F) +
+  scale_fill_manual(values = cols_Konf) +
+  #ggtitle("Konfederacja 2019") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank()) -> plotM_Konf
+
+ggplot(POW)+
+  geom_sf(aes(fill=factor(cut(locM_PiS15[,5], 
+                              breaks=brks_PiS15, 
+                              include.lowest = T))),
+          show.legend = F) +
+  scale_fill_manual(values = cols_PiS) +
+  #ggtitle("PiS 2015") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank()) -> plotM_PiS15
+ggplot(POW)+
+  geom_sf(aes(fill=factor(cut(locM_KO15[,5], 
+                              breaks=brks_KO15, 
+                              include.lowest = T))),
+          show.legend = F) +
+  scale_fill_manual(values = cols_KO) +
+  #ggtitle("KO 2015") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank()) -> plotM_KO15
+ggplot(POW)+
+  geom_sf(aes(fill=factor(cut(locM_Lewica15[,5], 
+                              breaks=brks_Lewica15, 
+                              include.lowest = T))),
+          show.legend = F) +
+  scale_fill_manual(values = cols_Lewica) +
+  #ggtitle("Lewica 2015") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank()) -> plotM_Lewica15
+ggplot(POW)+
+  geom_sf(aes(fill=factor(cut(locM_PSL15[,5], 
+                              breaks=brks_PSL15, 
+                              include.lowest = T))),
+          show.legend = F) +
+  scale_fill_manual(values = cols_PSL) +
+  #ggtitle("PSL 2015") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank()) -> plotM_PSL15
+ggplot(POW)+
+  geom_sf(aes(fill=factor(cut(locM_Konf15[,5], 
+                              breaks=brks_Konf15, 
+                              include.lowest = T))),
+          show.legend = F) +
+  scale_fill_manual(values = cols_Konf) +
+  #ggtitle("Konfederacja 2015") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank()) -> plotM_Konf15
+```
+
+```{r}
+#| label: fig-moran
+#| fig-cap: "Local Moran plots"
+#| fig-subcap: 
+#|   - "PiS 2019"
+#|   - "PiS 2015"
+#|   - "KO 2019"
+#|   - "KO 2015"
+#|   - "Lewica 2019"
+#|   - "Lewica 2015"
+#|   - "PSL 2019"
+#|   - "PSL 2015"
+#|   - "Konfederacja 2019"
+#|   - "Konfederacja 2015"
+#| layout-ncol: 3
+
+
+plotM_PiS
+plotM_PiS15
+plotM_KO
+plotM_KO15
+plotM_Lewica
+plotM_Lewica15
+plotM_PSL
+plotM_PSL15
+plotM_Konf 
+plotM_Konf15
+```
+
+```{r}
+#| label: local Getis-Ord plots
+
+# local Getis-Ord 2019
+locG_PiS <- POW %>% 
+  mutate(
+    Gi = local_g_perm(PiS, st.cont, 
+                      st.weights, 
+                      nsim = 999)
+  ) %>% 
+  unnest(Gi) %>% 
+  select(gi, p_folded_sim) %>% 
+  mutate(Spots = case_when(
+    gi > 0 & p_folded_sim <= 0.05 ~ "Hot",
+    gi < 0 & p_folded_sim <= 0.05 ~ "Cold",
+    TRUE ~ "Insignificant"
+  ),
+  Spots = factor(
+    Spots,
+    levels = c("Hot", "Insignificant", "Cold")
+  ))
+  
+locG_KO <- POW %>% 
+  mutate(
+    Gi = local_g_perm(KO, st.cont, 
+                      st.weights, 
+                      nsim = 999)
+  ) %>% 
+  unnest(Gi) %>% 
+  select(gi, p_folded_sim) %>% 
+  mutate(Spots = case_when(
+    gi > 0 & p_folded_sim <= 0.05 ~ "Hot",
+    gi < 0 & p_folded_sim <= 0.05 ~ "Cold",
+    TRUE ~ "Insignificant"
+  ),
+  Spots = factor(
+    Spots,
+    levels = c("Hot", "Insignificant", "Cold")
+  ))
+
+locG_Lewica <- POW %>% 
+  mutate(
+    Gi = local_g_perm(Lewica, st.cont, 
+                      st.weights, 
+                      nsim = 999)
+  ) %>% 
+  unnest(Gi) %>% 
+  select(gi, p_folded_sim) %>% 
+  mutate(Spots = case_when(
+    gi > 0 & p_folded_sim <= 0.05 ~ "Hot",
+    gi < 0 & p_folded_sim <= 0.05 ~ "Cold",
+    TRUE ~ "Insignificant"
+  ),
+  Spots = factor(
+    Spots,
+    levels = c("Hot", "Insignificant", "Cold")
+  ))
+
+locG_PSL <- POW %>% 
+  mutate(
+    Gi = local_g_perm(PSL, st.cont, 
+                      st.weights, 
+                      nsim = 999)
+  ) %>% 
+  unnest(Gi) %>% 
+  select(gi, p_folded_sim) %>% 
+  mutate(Spots = case_when(
+    gi > 0 & p_folded_sim <= 0.05 ~ "Hot",
+    gi < 0 & p_folded_sim <= 0.05 ~ "Cold",
+    TRUE ~ "Insignificant"
+  ),
+  Spots = factor(
+    Spots,
+    levels = c("Hot", "Insignificant", "Cold")
+  ))
+
+locG_Konfederacja <- POW %>% 
+  mutate(
+    Gi = local_g_perm(Konfederacja, st.cont, 
+                      st.weights,
+                      nsim = 999)
+  ) %>% 
+  unnest(Gi) %>% 
+  select(gi, p_folded_sim) %>% 
+  mutate(Spots = case_when(
+    gi > 0 & p_folded_sim <= 0.05 ~ "Hot",
+    gi < 0 & p_folded_sim <= 0.05 ~ "Cold",
+    TRUE ~ "Insignificant"
+  ),
+  Spots = factor(
+    Spots,
+    levels = c("Hot", "Insignificant", "Cold")
+  ))
+
+locG_PiS  %>%  
+  ggplot(aes(fill = Spots)) +
+  geom_sf(color = "black", lwd = 0.1) +
+  scale_fill_brewer(type = "div", palette = 5) +
+  #labs(title = "PiS 2019") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "none",
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank()) -> plotG_PiS
+locG_KO  %>%  
+  ggplot(aes(fill = Spots)) +
+  geom_sf(color = "black", lwd = 0.1) +
+  scale_fill_brewer(type = "div", palette = 5) +
+  #labs(title = "KO 2019") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "none",
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank()) -> plotG_KO
+locG_Lewica  %>%  
+  ggplot(aes(fill = Spots)) +
+  geom_sf(color = "black", lwd = 0.1) +
+  scale_fill_brewer(type = "div", palette = 5) +
+  #labs(title = "Lewica 2019") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "none",
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank()) -> plotG_Lewica
+locG_PSL  %>%  
+  ggplot(aes(fill = Spots)) +
+  geom_sf(color = "black", lwd = 0.1) +
+  scale_fill_brewer(type = "div", palette = 5) +
+  #labs(title = "PSL 2019") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "none",
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank()) -> plotG_PSL
+locG_Konfederacja  %>%  
+  ggplot(aes(fill = Spots)) +
+  geom_sf(color = "black", lwd = 0.1) +
+  scale_fill_brewer(type = "div", palette = 5) +
+  #labs(title = "Konfederacja 2019") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "none",
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank()) -> plotG_Konfederacja
+
+# local Getis-Ord 2015
+
+locG_PiS15 <- POW15 %>% 
+  mutate(
+    Gi = local_g_perm(PiS, st.cont, 
+                      st.weights,
+                      nsim = 999)
+  ) %>% 
+  unnest(Gi) %>% 
+  select(gi, p_folded_sim) %>% 
+  mutate(Spots = case_when(
+    gi > 0 & p_folded_sim <= 0.05 ~ "Hot",
+    gi < 0 & p_folded_sim <= 0.05 ~ "Cold",
+    TRUE ~ "Insignificant"
+  ),
+  Spots = factor(
+    Spots,
+    levels = c("Hot", "Insignificant", "Cold")
+  ))
+
+locG_KO15 <- POW15 %>% 
+  mutate(
+    Gi = local_g_perm(KO, st.cont, 
+                      st.weights, 
+                      nsim = 999)
+  ) %>% 
+  unnest(Gi) %>% 
+  select(gi, p_folded_sim) %>% 
+  mutate(Spots = case_when(
+    gi > 0 & p_folded_sim <= 0.05 ~ "Hot",
+    gi < 0 & p_folded_sim <= 0.05 ~ "Cold",
+    TRUE ~ "Insignificant"
+  ),
+  Spots = factor(
+    Spots,
+    levels = c("Hot", "Insignificant", "Cold")
+  ))
+
+locG_Lewica15 <- POW15 %>% 
+  mutate(
+    Gi = local_g_perm(Lewica, st.cont, 
+                      st.weights, 
+                      nsim = 999)
+  ) %>% 
+  unnest(Gi) %>% 
+  select(gi, p_folded_sim) %>% 
+  mutate(Spots = case_when(
+    gi > 0 & p_folded_sim <= 0.05 ~ "Hot",
+    gi < 0 & p_folded_sim <= 0.05 ~ "Cold",
+    TRUE ~ "Insignificant"
+  ),
+  Spots = factor(
+    Spots,
+    levels = c("Hot", "Insignificant", "Cold")
+  ))
+
+locG_PSL15 <- POW15 %>% 
+  mutate(
+    Gi = local_g_perm(PSL, st.cont, 
+                      st.weights, 
+                      nsim = 999)
+  ) %>% 
+  unnest(Gi) %>% 
+  select(gi, p_folded_sim) %>% 
+  mutate(Spots = case_when(
+    gi > 0 & p_folded_sim <= 0.05 ~ "Hot",
+    gi < 0 & p_folded_sim <= 0.05 ~ "Cold",
+    TRUE ~ "Insignificant"
+  ),
+  Spots = factor(
+    Spots,
+    levels = c("Hot", "Insignificant", "Cold")
+  ))
+
+locG_Konfederacja15 <- POW15 %>% 
+  mutate(
+    Gi = local_g_perm(Konfederacja, st.cont, 
+                      st.weights, 
+                      nsim = 999)
+  ) %>% 
+  unnest(Gi) %>% 
+  select(gi, p_folded_sim) %>% 
+  mutate(Spots = case_when(
+    gi > 0 & p_folded_sim <= 0.05 ~ "Hot",
+    gi < 0 & p_folded_sim <= 0.05 ~ "Cold",
+    TRUE ~ "Insignificant"
+  ),
+  Spots = factor(
+    Spots,
+    levels = c("Hot", "Insignificant", "Cold")
+  ))
+
+locG_PiS15  %>%  
+  ggplot(aes(fill = Spots)) +
+  geom_sf(color = "black", lwd = 0.1) +
+  scale_fill_brewer(type = "div", palette = 5) +
+  #labs(title = "PiS 2015") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "none",
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank()) -> plotG_PiS15
+locG_KO15  %>%  
+  ggplot(aes(fill = Spots)) +
+  geom_sf(color = "black", lwd = 0.1) +
+  scale_fill_brewer(type = "div", palette = 5) +
+  #labs(title = "KO 2015") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "none",
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank()) -> plotG_KO15
+locG_Lewica15  %>%  
+  ggplot(aes(fill = Spots)) +
+  geom_sf(color = "black", lwd = 0.1) +
+  scale_fill_brewer(type = "div", palette = 5) +
+  #labs(title = "Lewica 2015") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "none",
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank()) -> plotG_Lewica15
+locG_PSL15  %>%  
+  ggplot(aes(fill = Spots)) +
+  geom_sf(color = "black", lwd = 0.1) +
+  scale_fill_brewer(type = "div", palette = 5) +
+  #labs(title = "PSL 2015") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "none",
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank()) -> plotG_PSL15
+locG_Konfederacja15  %>%  
+  ggplot(aes(fill = Spots)) +
+  geom_sf(color = "black", lwd = 0.1) +
+  scale_fill_brewer(type = "div", palette = 5) +
+  #labs(title = "Konfederacja 2015") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "none",
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank()) -> plotG_Konfederacja15
+```
+
+```{r}
+#| label: fig-GetisOrd
+#| fig-cap: "Local Getis-Ord plots"
+#| fig-subcap: 
+#|   - "PiS 2019"
+#|   - "PiS 2015"
+#|   - "KO 2019"
+#|   - "KO 2015"
+#|   - "Lewica 2019"
+#|   - "Lewica 2015"
+#|   - "PSL 2019"
+#|   - "PSL 2015"
+#|   - "Konfederacja 2019"
+#|   - "Konfederacja 2015"
+#| layout-ncol: 3
+
+
+plotG_PiS
+plotG_PiS15
+plotG_KO
+plotG_KO15
+plotG_Lewica
+plotG_Lewica15
+plotG_PSL
+plotG_PSL15
+plotG_Konfederacja 
+plotG_Konfederacja15
+```
+
+## Spatial econometrics
+
+```{r}
+#| label: spatial econometrics
+data$ubostwo_pc1000 <- data$ubostwo/data$ludnosc*1000
+data$ubostwo_pc1000 <- data$ubostwo_pc1000/mean(data$ubostwo_pc1000)*100
+data$firmy_per_tys10 <- data$firmy_per_tys10/mean(data$firmy_per_tys10)*100
+data$inwestycje_per_capita <- data$inwestycje_per_capita/mean(data$inwestycje_per_capita)*100
+data$PiS <- results$PiS
+data$KO <- results$KO
+data$Lewica <- results$Lewica
+data$PSL <- results$PSL
+data$Konfederacja <- results$Konfederacja
+data$PiS15 <- results15$PiS
+data$KO15 <- results15$KO
+data$Lewica15 <- results15$Lewica
+data$PSL15 <- results15$PSL
+data$Konfederacja15 <- results15$Konfederacja
+data$lag.Konfederacja15 <- lag.listw(cont.listw, results15$Konfederacja)
+data$lag.Lewica15 <- lag.listw(cont.listw, results15$Lewica)
+data$lag.PiS15 <- lag.listw(cont.listw, results15$PiS)
+data$lag.KO15 <- lag.listw(cont.listw, results15$KO)
+data$lag.PSL15 <- lag.listw(cont.listw, results15$PSL)
+
+form_PiS <- PiS ~ PiS15 + wynagrodzenie + feminizacja + firmy_per_tys10 + demografia +
+  log(ludnosc_per_km) + bezrobocie + ubostwo_pc1000 + inwestycje_per_capita
+
+form_KO <- KO ~ KO15 + wynagrodzenie + feminizacja + firmy_per_tys10 + demografia +
+  log(ludnosc_per_km) + bezrobocie + ubostwo_pc1000 + inwestycje_per_capita
+
+form_Lewica <- Lewica ~ Lewica15 + wynagrodzenie + feminizacja + firmy_per_tys10 + demografia +
+  log(ludnosc_per_km) + bezrobocie + ubostwo_pc1000 + inwestycje_per_capita + lag.Lewica15
+
+form_PSL <- PSL ~ PSL15 + wynagrodzenie + feminizacja + firmy_per_tys10 + demografia +
+  log(ludnosc_per_km) + bezrobocie + ubostwo_pc1000 + inwestycje_per_capita
+
+form_Konfederacja <- Konfederacja ~ Konfederacja15 + wynagrodzenie + feminizacja + firmy_per_tys10 + demografia +
+  log(ludnosc_per_km) + bezrobocie + ubostwo_pc1000 + inwestycje_per_capita + lag.Konfederacja15
+
+estimate_models <- function (form) {
+  model.lm <<- lm(form, data = data)
+  GNS <<- sacsarlm(form, data = data, listw = cont.listw, type = "sacmixed", 
+                   method = "LU")
+  SAC <<- sacsarlm(form, data = data, listw = cont.listw)
+  SDEM <<- errorsarlm(form, data = data, listw = cont.listw, etype = "emixed")
+  SEM <<- errorsarlm(form, data = data, listw = cont.listw)
+  SDM <<- lagsarlm(form, data = data, listw = cont.listw, type = "mixed")
+  SAR <<- lagsarlm(form, data = data, listw = cont.listw)
+  SLX <<- lmSLX(form, data = data, listw = cont.listw)
+}
+```
+
+```{r}
+#| label: model estimation
+#| eval: false
+# change the argument for another party
+estimate_models(form_PiS)
+lm.morantest(model.lm, cont.listw, alternative = "two.sided")
+AIC(model.lm, GNS, SDM, SDEM, SLX, SAR, SAC, SEM)
+summary(GNS)
+summary(SDM)
+summary(SDEM)
+summary(SLX)
+summary(SAR)
+summary(SAC)
+summary(SEM)
+```
+
+A spatial econometric model was estimated for every political party. Moran's test indicated that residuals from OLS are spatially autocorrelated, which supports using spatial econometrics. Regression equations contain not only variables described in "Data description" but also an autoregressive term. This changes an interpretation of coefficients in terms of path dependence. The best spatial model for every contender was chosen based on AIC (see included codes). That is, for PiS, KO and PSL the best model was Spatial Durbin Model (SDM), and for Lewica and Konfederacja - Spatial Lag Model (SAR).
+
+@tbl-regression contains the results of the estimation. There is no spatial autocorrelation in residuals, which indicates a proper model specification. A spatial lag (*rho*) is statistically significant for every model. The autoregressive term and its lag are also statistically significant. The significance of the rest of the parameters depends on the political party and cannot be shortly summarised. The coefficients cannot be interpreted from the @tbl-regression because of including the spatial lag. @tbl-impacts-1 - @tbl-impacts-5 present direct, indirect, and total effects for every variable. The main and mutual for the parties conclusion is the high persistence of the spatial-time process. The highest impact on the vote shares is from the spatial-time lag.
+
+```{r}
+#| label: estimation
+SDM_PiS <- lagsarlm(form_PiS, data = data, listw = cont.listw, type = "mixed")
+SDM_KO <- lagsarlm(form_KO, data = data, listw = cont.listw, type = "mixed")
+SAR_Lewica <- lagsarlm(form_Lewica, data = data, listw = cont.listw)
+SDM_PSL <- lagsarlm(form_PSL, data = data, listw = cont.listw, type = "mixed")
+SAR_Konfederacja <- lagsarlm(form_Konfederacja, data = data, listw = cont.listw)
+
+# knitr::kable(data.frame("PiS" = moran.test(resid(SDM_PiS), cont.listw, alternative = "two.sided")$p.value,
+# "KO" = moran.test(resid(SDM_KO), cont.listw, alternative = "two.sided")$p.value,
+# "Lewica" = moran.test(resid(SAR_Lewica), cont.listw, alternative = "two.sided")$p.value,
+# "PSL" = moran.test(resid(SDM_PSL), cont.listw, alternative = "two.sided")$p.value,
+# "Konfederacja" = moran.test(resid(SAR_Konfederacja), cont.listw, alternative = "two.sided")$p.value))
+```
+
+```{r}
+#| label: tbl-regression
+#| tbl-cap: "Regression table"
+
+modelsummary(list("PiS" = SDM_PiS, 
+                  "KO" = SDM_KO,
+                  "Lewica" = SAR_Lewica,
+                  "PSL" = SDM_PSL,
+                  "Konfederacja" = SAR_Konfederacja),
+          coef_rename = c("PiS15" = "results15",
+                          "KO15" = "results15",
+                          "Lewica15" = "results15",
+                          "PSL15" = "results15",
+                          "Konfederacja15" = "results15",
+                          "lag.PiS15" = "lag.results15",
+                          "lag.KO15" = "lag.results15",
+                          "lag.Lewica15" = "lag.results15",
+                          "lag.PSL15" = "lag.results15",
+                          "lag.Konfederacja15" = "lag.results15",
+                          "wynagrodzenie" = "salary",
+                          "feminizacja" = "feminisation",
+                          "firmy_per_tys10" = "firms_per10k",
+                          "demografia" = "demography",
+                          "log(ludnosc_per_km)" = "log(pop_per_km)",
+                          "bezrobocie" = "unemployment",
+                          "ubostwo_pc1000" = "poverty_per1000",
+                          "inwestycje_per_capita" = "investments_pc",
+                          "lag.wynagrodzenie" = "lag.salary",
+                          "lag.feminizacja" = "lag.feminisation",
+                          "lag.firmy_per_tys10" = "lag.firms_per10k",
+                          "lag.demografia" = "lag.demography",
+                          "lag.log(ludnosc_per_km)" = "lag.log(pop_per_km)",
+                          "lag.bezrobocie" = "lag.unemployment",
+                          "lag.ubostwo_pc1000" = "lag.poverty_per1000",
+                          "lag.inwestycje_per_capita" = "lag.investments_pc"),
+                           gof_omit = "IC|RMSE")
+
+```
+
+```{r}
+#| label: tbl-impacts
+#| tbl-cap: 
+#|   - "PiS - impacts"
+#|   - "KO - impacts"
+#|   - "Lewica - impacts"
+#|   - "PSL - impacts"
+#|   - "Konfederacja - impacts"
+
+W.c <- as(as_dgRMatrix_listw(cont.listw), "CsparseMatrix") 
+trMat <- trW(W.c, type = "mult") 
+SDM_PiS_imp <- impacts(SDM_PiS, tr = trMat, R = 2000)$res %>% as.data.frame(
+                row.names = c("PiS15",
+                              "salary",
+                              "feminisation",
+                              "firms_per10k",
+                              "demography",
+                              "log(pop_per_km)",
+                              "unemplyoment",
+                              "poverty_per1000",
+                              "investments_pc"))
+SDM_KO_imp <- impacts(SDM_KO, tr = trMat, R = 2000)$res %>% as.data.frame(
+                row.names = c("KO15",
+                              "salary",
+                              "feminisation",
+                              "firms_per10k",
+                              "demography",
+                              "log(pop_per_km)",
+                              "unemplyoment",
+                              "poverty_per1000",
+                              "investments_pc"))
+SAR_Lewica_imp <- impacts(SAR_Lewica, tr = trMat, R = 2000)$res %>% 
+  as.data.frame(
+                row.names = c("Lewica15",
+                              "salary",
+                              "feminisation",
+                              "firms_per10k",
+                              "demography",
+                              "log(pop_per_km)",
+                              "unemplyoment",
+                              "poverty_per1000",
+                              "investments_pc",
+                              "lag.Lewica15"))
+SDM_PSL_imp <- impacts(SDM_PSL, tr = trMat, R = 2000)$res %>% as.data.frame(
+                row.names = c("PSL15",
+                              "salary",
+                              "feminisation",
+                              "firms_per10k",
+                              "demography",
+                              "log(pop_per_km)",
+                              "unemplyoment",
+                              "poverty_per1000",
+                              "investments_pc")
+)
+SAR_Konfederacja_imp <- impacts(SAR_Konfederacja, tr = trMat, R = 2000)$res %>% 
+  as.data.frame(row.names = c("Konfederacja15",
+                              "salary",
+                              "feminisation",
+                              "firms_per1000",
+                              "demography",
+                              "log(pop_per_km)",
+                              "unemplyoment",
+                              "poverty_per1000",
+                              "investments_pc",
+                              "lag.Konfederacja15"))
+knitr::kable(SDM_PiS_imp)
+knitr::kable(SDM_KO_imp)
+knitr::kable(SAR_Lewica_imp)
+knitr::kable(SDM_PSL_imp)
+knitr::kable(SAR_Konfederacja_imp)
+```
+
+## Conclusions
+
+The exploratory spatial data analysis confirmed spatial autocorrelation in the elections results. The global Moran statistic has shown that its strength depends on the obtained votes share (the higher the votes share, the stronger spatial autocorrelation). The local Moran statistics have indicated mainly two areas with spatial autocorrelation - north-western Poland and eastern Poland. It is especially true for the 3 largest parties, while for the rest the spatial autocorrelation is concentrated either in central Poland or in the periphery. Interestingly, based on Getis-Ord statistics, for PiS and PSL the large areas of spatially autocorrelated regions are *hot-spots*, whereas for the others they are usually *cold-spots*. Spatial econometrics has shown the persistence of the spatial-time process. However, the included socio-demographic variables do not explain much of the relation.
+
+The conducted analysis and plots can be a starting point for further studies. Especially considering the incoming elections in 2023. Collecting a dataset with a lower level of regions (*gminy*) would also be an interesting task.
+
+## References
